@@ -24,4 +24,6 @@ For a full tee bot, read [PORTING.md](PORTING.md) before taking code from `adapt
 
 Skills run from level 1 to 10. A skill upgrade changes the next bot decision; it does not grant a weapon. Pets use their saved weapon tier, while admin blockers use level 10. Hard map geometry and player fights still need live checks after each change; a successful compile cannot prove a rescue or throw will work on every map.
 
+Blockers stop pursuing a tee after that tee has stayed frozen on a freeze tile for one second. This includes airborne freeze. When the tee leaves the tile, the bot can target them again during the remaining freeze timer. The TeeTycoon game context owns that timer, so all bots see the same result.
+
 The adapter contains modified DDNet/Teeworlds code. Keep the original notices when redistributing it; see [LICENSE-DDNet.txt](LICENSE-DDNet.txt).
