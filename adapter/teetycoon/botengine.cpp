@@ -5,14 +5,24 @@
 #include <generated/protocol.h>
 #include <game/layers.h>
 #include <game/mapitems.h>
+#include <sqlite3.h>
 #include <cstdlib>
 #include <algorithm>
+#include <cmath>
+#include <functional>
+#include <limits>
 #include <optional>
 #include <queue>
 #include <vector>
 
 #include "bot.h"
 #include "botengine.h"
+
+static bool IsSupportedBotLearningMap(const char *pName)
+{
+	return pName && (str_comp(pName, "TeeTycoon") == 0 || str_comp(pName, "Copy Love Box-TT") == 0 ||
+		str_comp(pName, "blmapV3ROYAL-TT") == 0);
+}
 
 CGraph::CGraph()
 {
@@ -58,38 +68,53 @@ void CGraph::ComputeClosestPath()
 	if(!m_pClosestPath)
 		return;
 	std::fill(m_pClosestPath, m_pClosestPath + MatrixSize, -1);
-	std::vector<std::vector<int>> Adjacency(m_NumVertices);
+	std::vector<std::vector<std::pair<int, float>>> Adjacency(m_NumVertices);
 	for(int i = 0; i < m_NumEdges; i++)
 	{
 		const CEdge &Edge = m_pEdges[i];
 		if(Edge.m_StartID < 0 || Edge.m_StartID >= m_NumVertices || Edge.m_EndID < 0 || Edge.m_EndID >= m_NumVertices)
 			continue;
-		Adjacency[Edge.m_StartID].push_back(Edge.m_EndID);
+		const float Weight = distance(m_pVertices[Edge.m_StartID].m_Pos, m_pVertices[Edge.m_EndID].m_Pos);
+		Adjacency[Edge.m_StartID].push_back({Edge.m_EndID, Weight});
 	}
 
-	m_Diameter = 1;
-	std::vector<int> Dist(m_NumVertices);
-	std::queue<int> Queue;
+	m_Diameter = 0;
+	const float Infinity = std::numeric_limits<float>::infinity();
+	std::vector<float> Dist(m_NumVertices);
+	std::vector<int> FirstHop(m_NumVertices);
+	std::vector<int> Hops(m_NumVertices);
+	using SQueueEntry = std::pair<float, int>;
 	for(int Source = 0; Source < m_NumVertices; Source++)
 	{
-		std::fill(Dist.begin(), Dist.end(), -1);
-		while(!Queue.empty())
-			Queue.pop();
+		std::fill(Dist.begin(), Dist.end(), Infinity);
+		std::fill(FirstHop.begin(), FirstHop.end(), -1);
+		std::fill(Hops.begin(), Hops.end(), 0);
+		std::priority_queue<SQueueEntry, std::vector<SQueueEntry>, std::greater<SQueueEntry>> Queue;
 		Dist[Source] = 0;
-		Queue.push(Source);
+		Queue.push({0, Source});
 		while(!Queue.empty())
 		{
-			const int Current = Queue.front();
+			const auto [CurrentDistance, Current] = Queue.top();
 			Queue.pop();
-			for(const int Next : Adjacency[Current])
+			if(CurrentDistance > Dist[Current])
+				continue;
+			for(const auto &[Next, Weight] : Adjacency[Current])
 			{
-				if(Dist[Next] >= 0)
+				const float CandidateDistance = CurrentDistance + Weight;
+				const int CandidateHops = Hops[Current] + 1;
+				if(CandidateDistance > Dist[Next] ||
+					(CandidateDistance == Dist[Next] && CandidateHops >= Hops[Next]))
 					continue;
-				Dist[Next] = Dist[Current] + 1;
-				m_pClosestPath[Source + Next * m_NumVertices] = Current == Source ? Next : m_pClosestPath[Source + Current * m_NumVertices];
-				m_Diameter = std::max(m_Diameter, Dist[Next]);
-				Queue.push(Next);
+				Dist[Next] = CandidateDistance;
+				Hops[Next] = CandidateHops;
+				FirstHop[Next] = Current == Source ? Next : FirstHop[Current];
+				Queue.push({CandidateDistance, Next});
 			}
+		}
+		for(int Destination = 0; Destination < m_NumVertices; Destination++)
+		{
+			m_pClosestPath[Source + Destination * m_NumVertices] = FirstHop[Destination];
+			m_Diameter = std::max(m_Diameter, Hops[Destination]);
 		}
 	}
 	dbg_msg("botengine", "closest path computed, diameter=%d", m_Diameter);
@@ -113,6 +138,23 @@ int CGraph::GetPath(int Start, int End, vec2 *pVertices)
 	return Size;
 }
 
+float CGraph::GetPathDistance(int Start, int End) const
+{
+	if(Start < 0 || Start >= m_NumVertices || End < 0 || End >= m_NumVertices || !m_pVertices || !m_pClosestPath)
+		return std::numeric_limits<float>::infinity();
+	float TotalDistance = 0.0f;
+	int Current = Start;
+	for(int Hops = 0; Current != End && Hops < m_NumVertices; Hops++)
+	{
+		const int Next = m_pClosestPath[Current + End * m_NumVertices];
+		if(Next < 0 || Next >= m_NumVertices)
+			return std::numeric_limits<float>::infinity();
+		TotalDistance += distance(m_pVertices[Current].m_Pos, m_pVertices[Next].m_Pos);
+		Current = Next;
+	}
+	return Current == End ? TotalDistance : std::numeric_limits<float>::infinity();
+}
+
 CBotEngine::CBotEngine(CGameContext *pGameServer)
 {
 	m_pGameServer = pGameServer;
@@ -125,10 +167,22 @@ CBotEngine::CBotEngine(CGameContext *pGameServer)
 	m_SegmentCount = 0;
 	mem_zero(m_aPaths, sizeof(m_aPaths));
 	mem_zero(m_apBot, sizeof(m_apBot));
+	mem_zero(m_aBotTrails, sizeof(m_aBotTrails));
+	for(auto &Trail : m_aBotTrails)
+	{
+		Trail.m_LastTile = -1;
+		Trail.m_LastTileTick = -1;
+	}
 }
 
 void CBotEngine::Free()
 {
+	if(m_GraphBuildThread.joinable())
+		m_GraphBuildThread.join();
+	m_GraphBuildStarted = false;
+	m_GraphInitialized.store(false, std::memory_order_release);
+	m_GraphBuildFailed.store(false, std::memory_order_release);
+
 	m_vTeleEntrances.clear();
 	if(m_pGrid)
 		std::free(m_pGrid);
@@ -158,7 +212,7 @@ void CBotEngine::Free()
 	m_Graph.Free();
 	m_Graph.m_NumEdges = 0;
 	m_Graph.m_NumVertices = 0;
-	m_GraphInitialized = false;
+	m_GraphInitialized.store(false, std::memory_order_release);
 
 	for(int c = 0; c < MAX_CLIENTS; c++)
 	{
@@ -182,12 +236,49 @@ CBotEngine::~CBotEngine()
 
 void CBotEngine::Init(CTile *pTiles, int Width, int Height)
 {
+	// Join any prior map's build before replacing the grid data it reads.
+	Free();
 	m_pTiles = pTiles;
 
 	m_Width = Width;
 	m_Height = Height;
+	m_vNavigationDeaths.assign(static_cast<size_t>(Width) * Height, 0);
+	m_vNavigationBestTicks.assign(static_cast<size_t>(Width) * Height, std::numeric_limits<int>::max());
 
-	Free();
+	for(auto &Trail : m_aBotTrails)
+	{
+		mem_zero(&Trail, sizeof(Trail));
+		Trail.m_LastTile = -1;
+		Trail.m_LastTileTick = -1;
+	}
+	if(GameServer()->db && GameServer()->Map() && IsSupportedBotLearningMap(GameServer()->Map()->BaseName()))
+	{
+		sqlite3_stmt *pStmt = nullptr;
+		if(sqlite3_prepare_v2(GameServer()->db, "SELECT TILE_INDEX, DEATHS FROM TT_BOT_NAV_LEARNING WHERE MAP_NAME = ?1", -1, &pStmt, nullptr) == SQLITE_OK)
+		{
+			sqlite3_bind_text(pStmt, 1, GameServer()->Map()->BaseName(), -1, SQLITE_TRANSIENT);
+			while(sqlite3_step(pStmt) == SQLITE_ROW)
+			{
+				const int Tile = sqlite3_column_int(pStmt, 0);
+				const int Deaths = sqlite3_column_int(pStmt, 1);
+				if(Tile >= 0 && Tile < static_cast<int>(m_vNavigationDeaths.size()))
+					m_vNavigationDeaths[Tile] = static_cast<uint8_t>(std::clamp(Deaths, 0, 255));
+			}
+		}
+		sqlite3_finalize(pStmt);
+		if(sqlite3_prepare_v2(GameServer()->db, "SELECT TILE_INDEX, BEST_TICKS FROM TT_BOT_NAV_SPEED WHERE MAP_NAME = ?1", -1, &pStmt, nullptr) == SQLITE_OK)
+		{
+			sqlite3_bind_text(pStmt, 1, GameServer()->Map()->BaseName(), -1, SQLITE_TRANSIENT);
+			while(sqlite3_step(pStmt) == SQLITE_ROW)
+			{
+				const int Tile = sqlite3_column_int(pStmt, 0);
+				const int BestTicks = sqlite3_column_int(pStmt, 1);
+				if(Tile >= 0 && Tile < static_cast<int>(m_vNavigationBestTicks.size()))
+					m_vNavigationBestTicks[Tile] = std::max(1, BestTicks);
+			}
+		}
+		sqlite3_finalize(pStmt);
+	}
 	if(GameServer()->Collision()->TeleLayer())
 	{
 		for(int Index = 0; Index < Width * Height; ++Index)
@@ -296,11 +387,12 @@ void CBotEngine::Init(CTile *pTiles, int Width, int Height)
 		GenerateCorners();
 		GenerateSegments();
 	}
+	StartGraphBuild();
 }
 
 bool CBotEngine::InitGraph()
 {
-	if(m_GraphInitialized)
+	if(m_GraphInitialized.load(std::memory_order_acquire))
 		return true;
 	if(!m_pGrid)
 		return false;
@@ -310,20 +402,39 @@ bool CBotEngine::InitGraph()
 	if(!m_Graph.m_pClosestPath || m_Graph.m_NumVertices <= 0)
 		return false;
 
-	m_GraphInitialized = true;
+	m_GraphInitialized.store(true, std::memory_order_release);
 	return true;
+}
+
+void CBotEngine::StartGraphBuild()
+{
+	if(m_GraphBuildStarted || m_GraphInitialized.load(std::memory_order_acquire))
+		return;
+	m_GraphBuildStarted = true;
+	if(!m_pGrid)
+	{
+		m_GraphBuildFailed.store(true, std::memory_order_release);
+		return;
+	}
+	m_GraphBuildThread = std::thread([this] {
+		if(!InitGraph())
+		{
+			m_GraphBuildFailed.store(true, std::memory_order_release);
+			dbg_msg("botengine", "Navigation graph build failed; bots are unavailable on this map");
+		}
+	});
 }
 
 bool CBotEngine::InitPath(int ClientId)
 {
-	if(ClientId < 0 || ClientId >= MAX_CLIENTS || !m_GraphInitialized)
+	if(ClientId < 0 || ClientId >= MAX_CLIENTS || !m_GraphInitialized.load(std::memory_order_acquire))
 		return false;
 
 	CPath &Path = m_aPaths[ClientId];
 	if(Path.m_pVertices && Path.m_pSnapID)
 		return true;
 
-	Path.m_MaxSize = m_Graph.m_Diameter + 2;
+	Path.m_MaxSize = m_Graph.m_Diameter + 3;
 	Path.m_pVertices = static_cast<vec2 *>(std::malloc(Path.m_MaxSize * sizeof(vec2)));
 	Path.m_pSnapID = static_cast<int *>(std::malloc(Path.m_MaxSize * sizeof(int)));
 	if(!Path.m_pVertices || !Path.m_pSnapID)
@@ -358,7 +469,12 @@ bool CBotEngine::InitPath(int ClientId)
 
 bool CBotEngine::InitializeForBot(int ClientId)
 {
-	return InitGraph() && InitPath(ClientId);
+	if(!m_GraphInitialized.load(std::memory_order_acquire))
+	{
+		StartGraphBuild();
+		return false;
+	}
+	return InitPath(ClientId);
 }
 
 void CBotEngine::GenerateSegments()
@@ -864,8 +980,20 @@ void CBotEngine::GenerateGraphFromTriangles()
 	}
 	m_Graph.m_Width = m_Width;
 	m_Graph.m_NumVertices = m_Triangulation.m_Size;
+	if(m_Graph.m_NumVertices <= 0)
+	{
+		m_Graph.m_NumEdges = 0;
+		return;
+	}
 	m_Graph.m_pVertices = (CVertex *)std::malloc(m_Graph.m_NumVertices * sizeof(CVertex));
 	m_Graph.m_pEdges = (CEdge *)std::malloc(m_Graph.m_NumEdges * sizeof(CEdge));
+	if(!m_Graph.m_pVertices || (m_Graph.m_NumEdges > 0 && !m_Graph.m_pEdges))
+	{
+		m_Graph.Free();
+		m_Graph.m_NumVertices = 0;
+		m_Graph.m_NumEdges = 0;
+		return;
+	}
 	for(int i = 0; i < m_Triangulation.m_Size; i++)
 		m_Graph.m_pVertices[i].m_Pos = m_Triangulation.m_pTriangles[i].m_Triangle.Centroid() * 32 + vec2(16, 16);
 	CEdge *pEdge = m_Graph.m_pEdges;
@@ -946,12 +1074,20 @@ int CBotEngine::FastIntersectLine(int Id1, int Id2)
 
 void CBotEngine::GetPath(vec2 VStart, vec2 VEnd, CPath *pPath)
 {
-	if(!HasRoute(VStart, VEnd))
+	if(!pPath || !pPath->m_pVertices || !NavigationGraphReady())
+	{
+		if(pPath)
+			pPath->m_Size = 0;
+		return;
+	}
+	const int Start = GetClosestVisibleVertex(VStart);
+	const int End = GetClosestVisibleVertex(VEnd);
+	if(Start < 0 || End < 0 || !std::isfinite(m_Graph.GetPathDistance(Start, End)))
 	{
 		pPath->m_Size = 0;
 		return;
 	}
-	pPath->m_Size = m_Graph.GetPath(GetClosestVertex(VStart), GetClosestVertex(VEnd), pPath->m_pVertices + 1);
+	pPath->m_Size = m_Graph.GetPath(Start, End, pPath->m_pVertices + 1);
 	pPath->m_pVertices[0] = VStart;
 	pPath->m_pVertices[pPath->m_Size + 1] = VEnd;
 	pPath->m_Size = pPath->m_Size + 2;
@@ -959,11 +1095,20 @@ void CBotEngine::GetPath(vec2 VStart, vec2 VEnd, CPath *pPath)
 
 bool CBotEngine::HasRoute(vec2 VStart, vec2 VEnd)
 {
-	if(m_Graph.m_NumVertices <= 0 || !m_Graph.m_pVertices || !m_Graph.m_pClosestPath)
-		return false;
-	const int Start = GetClosestVertex(VStart);
-	const int End = GetClosestVertex(VEnd);
-	return Start == End || m_Graph.m_pClosestPath[Start + End * m_Graph.m_NumVertices] >= 0;
+	return std::isfinite(RouteDistance(VStart, VEnd));
+}
+
+float CBotEngine::RouteDistance(vec2 VStart, vec2 VEnd)
+{
+	const int Start = GetClosestVisibleVertex(VStart);
+	const int End = GetClosestVisibleVertex(VEnd);
+	if(Start < 0 || End < 0)
+		return std::numeric_limits<float>::infinity();
+	const float GraphDistance = m_Graph.GetPathDistance(Start, End);
+	if(!std::isfinite(GraphDistance))
+		return GraphDistance;
+	return distance(VStart, m_Graph.m_pVertices[Start].m_Pos) + GraphDistance +
+		distance(m_Graph.m_pVertices[End].m_Pos, VEnd);
 }
 
 int CBotEngine::GetPartialPath(vec2 Pos, vec2 Target, vec2 *pVertices, int MaxSize)
@@ -1111,22 +1256,203 @@ int CBotEngine::GetClosestVertex(vec2 Pos)
 	return i;
 }
 
+int CBotEngine::GetClosestVisibleVertex(vec2 Pos)
+{
+	if(!NavigationGraphReady() || !m_Graph.m_pVertices)
+		return -1;
+	int Closest = -1;
+	float BestDistance = std::numeric_limits<float>::infinity();
+	for(int Vertex = 0; Vertex < m_Graph.m_NumVertices; Vertex++)
+	{
+		const vec2 VertexPos = m_Graph.m_pVertices[Vertex].m_Pos;
+		if(GameServer()->Collision()->FastIntersectLine(Pos, VertexPos, nullptr, nullptr))
+			continue;
+		const float CandidateDistance = distance_squared(Pos, VertexPos);
+		if(CandidateDistance < BestDistance)
+		{
+			BestDistance = CandidateDistance;
+			Closest = Vertex;
+		}
+	}
+	return Closest;
+}
+
 void CBotEngine::OnCharacterDeath(int Victim, int Killer, int Weapon)
 {
 	if(m_apBot[Victim])
+	{
+		RecordNavigationDeath(Victim);
 		m_apBot[Victim]->m_GenomeTick >>= 1;
+	}
 	if(m_apBot[Killer])
 		m_apBot[Killer]->m_GenomeTick <<= 1;
 }
 
+void CBotEngine::TrackBotPosition(int ClientId, vec2 Pos, int Tick)
+{
+	if(ClientId < 0 || ClientId >= MAX_CLIENTS || m_Width <= 0 || m_Height <= 0)
+		return;
+	const int X = std::clamp(static_cast<int>(Pos.x / 32.0f), 0, m_Width - 1);
+	const int Y = std::clamp(static_cast<int>(Pos.y / 32.0f), 0, m_Height - 1);
+	const int Tile = Y * m_Width + X;
+	SBotTrail &Trail = m_aBotTrails[ClientId];
+	if(Tile == Trail.m_LastTile)
+		return;
+	const int ElapsedTicks = Trail.m_LastTileTick >= 0 ? std::max(1, Tick - Trail.m_LastTileTick) : -1;
+	Trail.m_LastTile = Tile;
+	Trail.m_LastTileTick = Tick;
+	if(Trail.m_Count < static_cast<int>(std::size(Trail.m_aTiles)))
+		Trail.m_aTiles[Trail.m_Count++] = Tile;
+	else
+	{
+		std::move(Trail.m_aTiles + 1, Trail.m_aTiles + std::size(Trail.m_aTiles), Trail.m_aTiles);
+		Trail.m_aTiles[std::size(Trail.m_aTiles) - 1] = Tile;
+	}
+	if(Tile >= 0 && Tile < static_cast<int>(m_vNavigationDeaths.size()) && GameServer()->db &&
+		GameServer()->Map() && IsSupportedBotLearningMap(GameServer()->Map()->BaseName()))
+	{
+		sqlite3_stmt *pStmt = nullptr;
+		if(sqlite3_prepare_v2(GameServer()->db, "INSERT INTO TT_BOT_NAV_LEARNING (MAP_NAME, TILE_INDEX, VISITS) VALUES (?1, ?2, 1) ON CONFLICT(MAP_NAME, TILE_INDEX) DO UPDATE SET VISITS = VISITS + 1", -1, &pStmt, nullptr) == SQLITE_OK)
+		{
+			sqlite3_bind_text(pStmt, 1, GameServer()->Map()->BaseName(), -1, SQLITE_TRANSIENT);
+			sqlite3_bind_int(pStmt, 2, Tile);
+			sqlite3_step(pStmt);
+		}
+		sqlite3_finalize(pStmt);
+		if(ElapsedTicks > 0)
+		{
+			m_vNavigationBestTicks[Tile] = std::min(m_vNavigationBestTicks[Tile], ElapsedTicks);
+			if(sqlite3_prepare_v2(GameServer()->db, "INSERT INTO TT_BOT_NAV_SPEED (MAP_NAME, TILE_INDEX, BEST_TICKS) VALUES (?1, ?2, ?3) ON CONFLICT(MAP_NAME, TILE_INDEX) DO UPDATE SET BEST_TICKS = MIN(BEST_TICKS, excluded.BEST_TICKS)", -1, &pStmt, nullptr) == SQLITE_OK)
+			{
+				sqlite3_bind_text(pStmt, 1, GameServer()->Map()->BaseName(), -1, SQLITE_TRANSIENT);
+				sqlite3_bind_int(pStmt, 2, Tile);
+				sqlite3_bind_int(pStmt, 3, ElapsedTicks);
+				sqlite3_step(pStmt);
+			}
+			sqlite3_finalize(pStmt);
+		}
+	}
+}
+
+int CBotEngine::NavigationDeathPenalty(vec2 Pos) const
+{
+	if(m_Width <= 0 || m_Height <= 0 || m_vNavigationDeaths.empty())
+		return 0;
+	const int X = std::clamp(static_cast<int>(Pos.x / 32.0f), 0, m_Width - 1);
+	const int Y = std::clamp(static_cast<int>(Pos.y / 32.0f), 0, m_Height - 1);
+	return m_vNavigationDeaths[Y * m_Width + X];
+}
+
+int CBotEngine::NavigationBestTileTicks(vec2 Pos) const
+{
+	if(m_Width <= 0 || m_Height <= 0 || m_vNavigationBestTicks.empty())
+		return std::numeric_limits<int>::max();
+	const int X = std::clamp(static_cast<int>(Pos.x / 32.0f), 0, m_Width - 1);
+	const int Y = std::clamp(static_cast<int>(Pos.y / 32.0f), 0, m_Height - 1);
+	return m_vNavigationBestTicks[Y * m_Width + X];
+}
+
+bool CBotEngine::TryClaimLocalRouteSearch(int ClientId, int Tick)
+{
+	if(ClientId < 0 || ClientId >= MAX_CLIENTS || Tick < 0 ||
+		Tick % MAX_CLIENTS != ClientId % MAX_CLIENTS || m_LastLocalRouteSearchTick == Tick)
+		return false;
+	m_LastLocalRouteSearchTick = Tick;
+	return true;
+}
+
+int CBotEngine::NavigationBudget(int ClientId, int Tick)
+{
+	m_aNavigationRequests[ClientId] = Tick + 1;
+	if(m_NavigationWorkTick == Tick)
+		return 0;
+	for(int Offset = 0; Offset < MAX_CLIENTS; ++Offset)
+	{
+		const int Candidate = (m_NavigationNextClient + Offset) % MAX_CLIENTS;
+		if((Candidate & 1) != (Tick & 1) || m_aNavigationRequests[Candidate] == 0 || m_aNavigationRequests[Candidate] < Tick - 8)
+			continue;
+		if(Candidate != ClientId)
+			return 0;
+		m_NavigationWorkTick = Tick;
+		m_NavigationNextClient = (ClientId + 1) % MAX_CLIENTS;
+		return 256;
+	}
+	return 0;
+}
+
+bool CBotEngine::NavigationMovementBudget(int ClientId, int Tick)
+{
+	m_aNavigationMovementRequests[ClientId] = Tick + 1;
+	if(m_NavigationMovementTick != Tick)
+	{
+		m_NavigationMovementTick = Tick;
+		m_NavigationMovementCount = 0;
+	}
+	if(m_NavigationMovementCount >= 4)
+		return false;
+	for(int Offset = 0; Offset < MAX_CLIENTS; ++Offset)
+	{
+		const int Candidate = (m_NavigationMovementClient + Offset) % MAX_CLIENTS;
+		if((Candidate & 1) != (Tick & 1) || m_aNavigationMovementRequests[Candidate] == 0 || m_aNavigationMovementRequests[Candidate] < Tick - 14)
+			continue;
+		if(Candidate != ClientId)
+			return false;
+		++m_NavigationMovementCount;
+		m_NavigationMovementClient = (ClientId + 1) % MAX_CLIENTS;
+		m_aNavigationMovementRequests[ClientId] = 0;
+		return true;
+	}
+	return false;
+}
+
+void CBotEngine::RecordNavigationDeath(int ClientId)
+{
+	if(ClientId < 0 || ClientId >= MAX_CLIENTS || !GameServer()->db || !GameServer()->Map() ||
+		!IsSupportedBotLearningMap(GameServer()->Map()->BaseName()))
+		return;
+	SBotTrail &Trail = m_aBotTrails[ClientId];
+	sqlite3_stmt *pStmt = nullptr;
+	if(sqlite3_prepare_v2(GameServer()->db, "INSERT INTO TT_BOT_NAV_LEARNING (MAP_NAME, TILE_INDEX, DEATHS) VALUES (?1, ?2, 1) ON CONFLICT(MAP_NAME, TILE_INDEX) DO UPDATE SET DEATHS = DEATHS + 1", -1, &pStmt, nullptr) != SQLITE_OK)
+		return;
+	const int Begin = std::max(0, Trail.m_Count - 6);
+	for(int i = Begin; i < Trail.m_Count; i++)
+	{
+		const int Tile = Trail.m_aTiles[i];
+		if(Tile < 0 || Tile >= static_cast<int>(m_vNavigationDeaths.size()))
+			continue;
+		m_vNavigationDeaths[Tile] = static_cast<uint8_t>(std::min(255, m_vNavigationDeaths[Tile] + 1));
+		sqlite3_reset(pStmt);
+		sqlite3_clear_bindings(pStmt);
+		sqlite3_bind_text(pStmt, 1, GameServer()->Map()->BaseName(), -1, SQLITE_TRANSIENT);
+		sqlite3_bind_int(pStmt, 2, Tile);
+		sqlite3_step(pStmt);
+	}
+	sqlite3_finalize(pStmt);
+	Trail.m_Count = 0;
+	Trail.m_LastTile = -1;
+	Trail.m_LastTileTick = -1;
+}
+
 void CBotEngine::RegisterBot(int CID, CBot *pBot)
 {
-	m_apBot[CID] = pBot;
+	if(CID >= 0 && CID < MAX_CLIENTS)
+	{
+		m_apBot[CID] = pBot;
+		mem_zero(&m_aBotTrails[CID], sizeof(m_aBotTrails[CID]));
+		m_aBotTrails[CID].m_LastTile = -1;
+		m_aBotTrails[CID].m_LastTileTick = -1;
+	}
 }
 
 void CBotEngine::UnRegisterBot(int CID)
 {
-	m_apBot[CID] = 0;
+	if(CID >= 0 && CID < MAX_CLIENTS)
+	{
+		m_apBot[CID] = 0;
+		mem_zero(&m_aBotTrails[CID], sizeof(m_aBotTrails[CID]));
+		m_aBotTrails[CID].m_LastTile = -1;
+		m_aBotTrails[CID].m_LastTileTick = -1;
+	}
 }
 
 int CBotEngine::NetworkClipped(int SnappingClient, vec2 CheckPos)

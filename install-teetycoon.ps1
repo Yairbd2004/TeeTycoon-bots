@@ -9,7 +9,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $destination 'gamecontext.cpp'))) {
     throw "Expected a TeeTycoon src/game/server directory: $destination"
 }
 
-foreach ($file in @('bot.cpp', 'bot.h', 'botengine.cpp', 'botengine.h', 'pet_skill_storage.h')) {
+foreach ($file in @('bot.cpp', 'bot_navigation.cpp', 'bot.h', 'botengine.cpp', 'botengine.h', 'pet_skill_storage.h')) {
     Copy-Item -LiteralPath (Join-Path $repoRoot "adapter/teetycoon/$file") -Destination (Join-Path $destination $file) -Force
 }
 

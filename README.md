@@ -27,3 +27,10 @@ Skills run from level 1 to 10. A skill upgrade changes the next bot decision; it
 Blockers stop pursuing a tee after that tee has stayed frozen on a freeze tile for one second. This includes airborne freeze. When the tee leaves the tile, the bot can target them again during the remaining freeze timer. The TeeTycoon game context owns that timer, so all bots see the same result.
 
 The adapter contains modified DDNet/Teeworlds code. Keep the original notices when redistributing it; see [LICENSE-DDNet.txt](LICENSE-DDNet.txt).
+
+The v0.3.0 navigation update uses a sparse search that continues across game
+ticks, including maps larger than 200,000 cells. Route following has its own
+physics controller so combat steering cannot pull a bot into a wall while it
+is trying to get around it. The TeeTycoon spawn-room detour, weapon stairs,
+teleporter 249 and a changed destination have been exercised on the real Linux
+server. These are tested cases, not a guarantee of perfect play on every map.

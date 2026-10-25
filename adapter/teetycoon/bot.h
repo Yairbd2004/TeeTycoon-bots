@@ -6,6 +6,7 @@
 #include "gamecontext.h"
 #include "botengine.h"
 #include "bot_ai/skills.h"
+#include "bot_ai/navigation.h"
 
 #include "ai/genetics.h"
 #include "ai/strategy.h"
@@ -49,7 +50,7 @@ protected:
 	class CGameContext *GameServer() { return BotEngine()->GameServer(); }
 
 	class CCollision *Collision() { return GameServer()->Collision(); }
-	class CTuningParams *Tuning() { return GameServer()->GlobalTuning(); }
+	class CTuningParams *Tuning();
 
 	CBotEngine::CPath *m_pPath;
 
@@ -120,9 +121,9 @@ protected:
 	void UpdateEdge();
 	void MakeChoice(bool UseTarget);
 	int Skill(EPetSkill SkillId) const;
-	bool IsDangerous(vec2 Pos);
+	bool IsDangerous(vec2 Pos, int Team = -1);
 	void ApplyMovementSkills();
-	bool DefendAgainstUpwardThrow();
+	bool DefendAgainstUpwardThrow(bool CombatHookAim);
 	bool FindBounceAim(vec2 Target, vec2 *pAim);
 
 	int GetTile(int x, int y) { return BotEngine()->GetTile(x/32,y/32);}
@@ -148,16 +149,51 @@ public:
 	bool m_Rescuing = false;
 	bool m_Fighting = false;
 	int m_ThreatUntilTick = 0;
+	int m_SelfAggressorId = -1;
+	int m_SelfAggressorSpawnTick = -1;
+	int m_SelfAggressorUntilTick = 0;
 	std::unordered_set<std::string> m_HelpNames;
 	std::unordered_set<std::string> m_BlockNames;
 	int m_FreezeRespawnSeconds = 10;
+	int m_NinjaActiveUntilTick = 0;
+	int m_NinjaCooldownUntilTick = 0;
+	int m_NinjaNextDashTick = 0;
+	int m_MobilityShotgunTick = 0;
+	int m_MobilityGrenadeTick = 0;
 	int m_FrozenSinceTick = -1;
 	bool m_RespawnFromFreeze = false;
 	bool m_RaceToFrozenOwner = false;
-	int m_LastTeleSearchTick = -1;
-	vec2 m_TeleTarget = vec2(0, 0);
-	bool m_HasTeleTarget = false;
 	bool m_UsingLocalRoute = false;
+	struct SNavigationPoint { vec2 m_Pos; bool m_Teleport; };
+	bot_ai::CNavigationSearch m_NavigationSearch;
+	std::vector<SNavigationPoint> m_vNavigationRoute;
+	std::array<int, 16> m_aNavigationSnapIds;
+	int m_NavigationIndex = 0;
+	int m_NavigationTargetId = -2;
+	vec2 m_NavigationGoal = vec2(0, 0);
+	vec2 m_NavigationSearchStart = vec2(0, 0);
+	bool m_NavigationActive = false;
+	bool m_NavigationTest = false;
+	bool m_NavigationTrace = false;
+	bool m_NavigationHasTeleports = false;
+	vec2 m_NavigationTestGoal = vec2(0, 0);
+	int m_NavigationPlanTick = -1;
+	int m_NavigationControlTick = -1;
+	int m_NavigationProgressTick = -1;
+	int m_NavigationProgressIndex = -1;
+	float m_NavigationBestDistance = 1e30f;
+	int m_NavigationDirection = 0;
+	bool m_NavigationJump = false;
+	bool m_NavigationHook = false;
+	vec2 m_NavigationAnchor = vec2(0, 0);
+	void ResetNavigation();
+	bool NavigationClear(vec2 From, vec2 To, bool CheckHazards = true);
+	unsigned char NavigationCellFlags(bot_ai::CNavigationSearch &Search, int Cell);
+	void StepNavigationSearch(bot_ai::CNavigationSearch &Search, int Budget, bool Teleports);
+	void SimulateNavigationTick(CCharacterCore &Core, int &FreezeTicks);
+	int NavigationPortalLanding(bot_ai::CNavigationSearch &Search, vec2 Exit);
+	bool UpdateNavigation(vec2 Goal, int TargetId, bool Force = false);
+	void DriveNavigation();
 	int m_LastRescuePlanTick = -1;
 	int m_RescueTargetId = -1;
 	vec2 m_RescueWaypoint = vec2(0, 0);
@@ -167,11 +203,7 @@ public:
 	int m_RescueCandidateOffset = 0;
 	vec2 m_RescueProgressPos = vec2(0, 0);
 	int m_RescueProgressTick = -1;
-	int m_LastLocalPlanTick = -1;
-	int m_LocalTargetId = -1;
-	vec2 m_LocalWaypoint = vec2(0, 0);
-	vec2 m_LastLocalTargetPos = vec2(0, 0);
-	bool m_HasLocalPath = false;
+	bool m_LocalRouteSearchDeferred = false;
 	bool m_NoSafeRoute = false;
 	int m_LastFreezeCrossPlanTick = -1;
 	int m_FreezeCrossUntilTick = -1;
@@ -186,9 +218,30 @@ public:
 	vec2 m_BlockStance = vec2(0, 0);
 	vec2 m_BlockWaypoint = vec2(0, 0);
 	vec2 m_LastBlockTargetPos = vec2(0, 0);
+	bool m_LastBlockTargetOnFreeze = false;
 	int m_LastBlockStancePlanTick = -1;
+	int m_LastBlockGrenadePlanTick = -1;
+	int m_LastThinkTick = -1;
+	int m_BlockGrenadeTargetId = -1;
+	int m_BlockGrenadeCooldownUntilTick = 0;
+	vec2 m_BlockGrenadeTargetPos = vec2(0, 0);
+	vec2 m_BlockGrenadeGoal = vec2(0, 0);
+	vec2 m_BlockGrenadeAim = vec2(0, 0);
 	bool m_HasBlockFreezeGoal = false;
 	bool m_HasBlockStance = false;
+	bool m_HasBlockGrenadeAim = false;
+	int m_LastBlockJumpCheckTick = -1;
+	int m_BlockJumpCooldownUntilTick = -1;
+	bool m_BlockJumpArcSafe = false;
+	int m_PlayerHookTargetId = -1;
+	int m_PlayerHookHoldUntilTick = -1;
+	mutable int m_BlockerAllyCacheTick = -1;
+	mutable int m_BlockerAllyHumanId = -1;
+	bool m_BlockerSpawnTelePending = false;
+	bool m_BlockerSpawnTeleUsed = false;
+	vec2 m_BlockerSpawnTelePos = vec2(0, 0);
+	vec2 m_BlockerPatrolPos = vec2(0, 0);
+	int m_LastBlockerPatrolTick = -1;
 	vec2 m_LastProgressPos = vec2(0, 0);
 	int m_LastProgressTick = -1;
 	vec2 m_LastGoalProgressTarget = vec2(0, 0);
@@ -197,24 +250,33 @@ public:
 	int m_LastRouteRefreshTick = -1;
 	bool m_TriedWallJump = false;
 	int m_LastWallHookPlanTick = -1;
+	int m_DefenseHookUntilTick = -1;
+	vec2 m_DefenseHookAim = vec2(0, 1);
 	bool CanUseWeapon(int Weapon) const;
+	void ApplyPurchasedWeapons();
+	void UpdatePetNinja();
+	bool TryMobilityWeapon();
 	bool CanHammerHit(CCharacter *pTarget);
-	bool FindLocalRoute(vec2 Start, vec2 Goal, vec2 *pWaypoint);
+	bool FindLocalRoute(vec2 Start, vec2 Goal, vec2 *pWaypoint, std::vector<vec2> *pWaypoints = nullptr);
 	bool HasReachableClimbHook(vec2 Position);
 	bool FindRescueRoute(int TargetId, vec2 TargetPos, vec2 *pWaypoint);
 	bool SafeTravelSegment(vec2 Start, vec2 End);
 	bool HasFreezeBelow(vec2 Pos, float MaxDistance);
-	bool IsFreezeAt(vec2 Pos);
-	bool IsInFreezeFootprint(vec2 Pos);
-	bool IsDeathAt(vec2 Pos);
+	bool IsFreezeAt(vec2 Pos, int Team = -1);
+	bool IsInFreezeFootprint(vec2 Pos, int Team = -1);
+	bool IsDeathAt(vec2 Pos, int Team = -1);
+	float FreezeClearanceAbove(vec2 Pos, float MaxDistance);
 	bool FindSafeFreezeCrossing(vec2 Goal, int *pDirection, int *pJump, int *pHook, vec2 *pAim);
 	bool FindBlockFreezeGoal(vec2 TargetPos, int RemainingFreezeTicks, vec2 *pGoal, bool *pSupported);
+	bool FindBlockGrenadeAim(CCharacter *pTarget, vec2 FreezeGoal, vec2 *pAim);
 	bool FindBlockStance(vec2 MyPos, vec2 TargetPos, vec2 FreezeGoal, vec2 *pStance, vec2 *pWaypoint);
-	bool ShouldHoldEnemyHook(const CCharacter *pTarget, vec2 FreezeGoal);
+	bool ShouldHoldEnemyHook(CCharacter *pTarget, vec2 FreezeGoal);
 	void OnSkillUpgrade();
 	bool IsHelpTarget(const CPlayer *pTarget, int TargetId) const;
+	bool IsNearbyBlockerAlly(const CPlayer *pTarget) const;
 	bool IsBlockTarget(const CPlayer *pTarget, int TargetId) const;
 	void NotifyProtectedPlayerHurt(int VictimId, int EnemyId, bool DealtDamage);
+	void NotifyAttackedBy(int EnemyId);
 	void checkStuck(bool inSight);
 	void emote();
 	int GetID() { return m_SnapID; }

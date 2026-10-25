@@ -2,6 +2,9 @@
 #define GAME_SERVER_BOTENGINE_H
 
 #include <base/vmath.h>
+#include <atomic>
+#include <array>
+#include <thread>
 #include <vector>
 
 const char g_IsRemovable[256] = { 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 0};
@@ -195,6 +198,7 @@ public:
 	void ComputeClosestPath();
 
 	int GetPath(int VStart, int VEnd, vec2 *pVertices);
+	float GetPathDistance(int VStart, int VEnd) const;
 
 	vec2 ConvertIndex(int ID) { return vec2(ID%m_Width,ID/m_Width)*32 + vec2(16.,16.); }
 };
@@ -222,9 +226,30 @@ protected:
 
 	int m_Width;
 	int m_Height;
+	std::vector<uint8_t> m_vNavigationDeaths;
+	std::vector<int> m_vNavigationBestTicks;
+	struct SBotTrail
+	{
+		int m_aTiles[12];
+		int m_Count;
+		int m_LastTile;
+		int m_LastTileTick;
+	};
+	SBotTrail m_aBotTrails[MAX_CLIENTS];
 
 	CGraph m_Graph;
-	bool m_GraphInitialized = false;
+	std::atomic<bool> m_GraphInitialized{false};
+	std::atomic<bool> m_GraphBuildFailed{false};
+	std::thread m_GraphBuildThread;
+	bool m_GraphBuildStarted = false;
+	int m_LastLocalRouteSearchTick = -1;
+	std::array<int, MAX_CLIENTS> m_aNavigationRequests{};
+	int m_NavigationNextClient = 0;
+	int m_NavigationWorkTick = -1;
+	int m_NavigationMovementTick = -1;
+	int m_NavigationMovementCount = 0;
+	std::array<int, MAX_CLIENTS> m_aNavigationMovementRequests{};
+	int m_NavigationMovementClient = 0;
 	struct CTriangulation {
 		struct CTriangleData {
 			CTriangle m_Triangle;
@@ -240,7 +265,9 @@ protected:
 	void GenerateTriangles();
 	void GenerateGraphFromTriangles();
 	bool InitGraph();
+	void StartGraphBuild();
 	bool InitPath(int ClientId);
+	int GetClosestVisibleVertex(vec2 Pos);
 
 	vec2 m_aFlagStandPos[2];
 	int m_aBotSnapID[MAX_CLIENTS];
@@ -272,6 +299,7 @@ public:
 
 	void GetPath(vec2 VStart, vec2 VEnd, CPath* pPath);
 	bool HasRoute(vec2 VStart, vec2 VEnd);
+	float RouteDistance(vec2 VStart, vec2 VEnd);
 	int GetPartialPath(vec2 VStart, vec2 VEnd, vec2 *pVertices, int MaxSize);
 	vec2 NextPoint(vec2 Pos, vec2 Target);
 
@@ -293,12 +321,21 @@ public:
 
 	void Init(class CTile *pTiles, int Width, int Height);
 	bool InitializeForBot(int ClientId);
+	bool NavigationGraphReady() const { return m_GraphInitialized.load(std::memory_order_acquire); }
+	bool NavigationGraphFailed() const { return m_GraphBuildFailed.load(std::memory_order_acquire); }
 	void Snap(int SnappingClient);
 	void OnRelease();
 
 	int NetworkClipped(int SnappingClient, vec2 CheckPos);
 
 	void OnCharacterDeath(int Victim, int Killer, int Weapon);
+	void TrackBotPosition(int ClientId, vec2 Pos, int Tick);
+	int NavigationDeathPenalty(vec2 Pos) const;
+	int NavigationBestTileTicks(vec2 Pos) const;
+	bool TryClaimLocalRouteSearch(int ClientId, int Tick);
+	int NavigationBudget(int ClientId, int Tick);
+	bool NavigationMovementBudget(int ClientId, int Tick);
+	void RecordNavigationDeath(int ClientId);
 	void RegisterBot(int CID, class CBot *pBot);
 	void UnRegisterBot(int CID);
 
